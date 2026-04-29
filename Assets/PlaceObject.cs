@@ -2,17 +2,12 @@
 //  PlaceObject.cs  –  MASTER AR Furniture Placement Controller
 //  Unity AR Foundation + ARCore / ARKit
 //
-//  SETUP CHECKLIST (do this before building):
-//  ──────────────────────────────────────────
-//  1. Attach this script to your "PlacementManager" GameObject
-//  2. PlacementManager must also have ARRaycastManager component
-//  3. In Inspector, drag prefabs into: Chair Prefab, Sofa Prefab, Table Prefab
-//  4. Wire buttons:
-//       ChairButton  OnClick → PlaceObject.SelectChair()
-//       SofaButton   OnClick → PlaceObject.SelectSofa()
-//       TableButton  OnClick → PlaceObject.SelectTable()
-//  5. Canvas must have a GraphicRaycaster  (yours should already)
-//  6. EventSystem must exist in scene      (yours already does ✓)
+//  DELETE SYSTEM:
+//  - Select a furniture button (Chair/Sofa/Table)
+//  - If that object is already placed, a red "🗑 Remove" button
+//    appears at the bottom of the screen automatically
+//  - Tap "🗑 Remove" → object is instantly deleted
+//  - No Unity UI changes needed — button is drawn by OnGUI
 // ============================================================
 
 using System.Collections.Generic;
@@ -29,18 +24,14 @@ public class PlaceObject : MonoBehaviour
     // ═══════════════════════════════════════════════════════
 
     [Header("Furniture Prefabs")]
-    [Tooltip("Drag Chair_1 prefab here")]
     public GameObject chairPrefab;
-
-    [Tooltip("Drag Sofa3 or Sofa_Fixed prefab here")]
     public GameObject sofaPrefab;
-
-    [Tooltip("Drag Table_Rou prefab here")]
     public GameObject tablePrefab;
 
-    [Header("Spawn Tuning")]
-    [Tooltip("Scale every object gets on spawn. Increase if models appear tiny.")]
-    public float spawnScale = 1.0f;
+    [Header("Per-Object Spawn Scale")]
+    public float chairScale = 1.0f;
+    public float sofaScale = 1.0f;
+    public float tableScale = 1.0f;
 
     [Tooltip("Rotation fix. Try (-90,0,0) if models spawn lying flat.")]
     public Vector3 rotationOffset = new Vector3(0f, 0f, 0f);
@@ -56,11 +47,11 @@ public class PlaceObject : MonoBehaviour
     private ARRaycastManager _arRaycast;
     private static readonly List<ARRaycastHit> Hits = new List<ARRaycastHit>();
 
-    private GameObject _activePrefab;      // chosen via button
+    private GameObject _activePrefab;
     private GameObject _chairInstance;
     private GameObject _sofaInstance;
     private GameObject _tableInstance;
-    private GameObject _selectedInstance;  // responds to pinch / twist
+    private GameObject _selectedInstance;
 
     // Two-finger gesture state
     private float _pinchStartDist;
@@ -68,6 +59,10 @@ public class PlaceObject : MonoBehaviour
     private float _twistStartAngle;
     private float _twistStartY;
     private bool _twoFingerActive;
+
+    // OnGUI style
+    private GUIStyle _removeButtonStyle;
+    private bool _styleReady = false;
 
     // ═══════════════════════════════════════════════════════
     //  UNITY LIFECYCLE
@@ -102,28 +97,71 @@ public class PlaceObject : MonoBehaviour
     }
 
     // ═══════════════════════════════════════════════════════
-    //  PUBLIC BUTTON METHODS
+    //  ON GUI — draws the Remove button when relevant
+    // ═══════════════════════════════════════════════════════
+
+    private void OnGUI()
+    {
+        // Only show Remove button if the currently selected type is already placed
+        if (_activePrefab == null) return;
+        if (CurrentInstance() == null) return;
+
+        // Build style once
+        if (!_styleReady)
+        {
+            _removeButtonStyle = new GUIStyle(GUI.skin.button)
+            {
+                fontSize = 28,
+                fontStyle = FontStyle.Bold,
+                alignment = TextAnchor.MiddleCenter,
+            };
+            _removeButtonStyle.normal.textColor = Color.white;
+            _removeButtonStyle.hover.textColor = Color.white;
+            _removeButtonStyle.active.textColor = Color.white;
+            _styleReady = true;
+        }
+
+        // Button size & position — bottom center of screen
+        float btnW = 260f;
+        float btnH = 80f;
+        float btnX = (Screen.width - btnW) / 2f;
+        float btnY = Screen.height - btnH - 40f;
+
+        Color prev = GUI.backgroundColor;
+        GUI.backgroundColor = new Color(0.85f, 0.1f, 0.1f, 1f); // red
+
+        if (GUI.Button(new Rect(btnX, btnY, btnW, btnH),
+                       "🗑  Remove " + _activePrefab.name, _removeButtonStyle))
+        {
+            DeleteCurrent();
+        }
+
+        GUI.backgroundColor = prev;
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  PUBLIC SELECT BUTTONS (wire to ChairButton etc.)
     // ═══════════════════════════════════════════════════════
 
     public void SelectChair()
     {
         _activePrefab = chairPrefab;
         _selectedInstance = _chairInstance;
-        Debug.Log("[PlaceObject] Chair selected — tap the floor.");
+        Debug.Log("[PlaceObject] Chair selected.");
     }
 
     public void SelectSofa()
     {
         _activePrefab = sofaPrefab;
         _selectedInstance = _sofaInstance;
-        Debug.Log("[PlaceObject] Sofa selected — tap the floor.");
+        Debug.Log("[PlaceObject] Sofa selected.");
     }
 
     public void SelectTable()
     {
         _activePrefab = tablePrefab;
         _selectedInstance = _tableInstance;
-        Debug.Log("[PlaceObject] Table selected — tap the floor.");
+        Debug.Log("[PlaceObject] Table selected.");
     }
 
     // ═══════════════════════════════════════════════════════
@@ -132,8 +170,10 @@ public class PlaceObject : MonoBehaviour
 
     private void HandleSingleTouch(Touch touch)
     {
-        // Block touches that land on UI buttons
         if (IsTouchOnUI(touch)) return;
+
+        // Block touches in the OnGUI Remove button area
+        if (IsRemoveButtonArea(touch.position)) return;
 
         if (_activePrefab == null)
         {
@@ -152,7 +192,6 @@ public class PlaceObject : MonoBehaviour
 
             Vector3 hitPos = Hits[0].pose.position;
             Quaternion hitRot = Hits[0].pose.rotation;
-
             GameObject existing = CurrentInstance();
 
             if (existing == null)
@@ -161,12 +200,11 @@ public class PlaceObject : MonoBehaviour
             {
                 existing.transform.position = hitPos;
                 _selectedInstance = existing;
-                Debug.Log($"[PlaceObject] Moved '{existing.name}' → {hitPos}");
+                Debug.Log($"[PlaceObject] Moved '{existing.name}'");
             }
         }
         else if (touch.phase == TouchPhase.Moved && _selectedInstance != null)
         {
-            // Smooth drag along detected planes
             if (!_arRaycast.Raycast(touch.position, Hits, TrackableType.PlaneWithinPolygon)) return;
             _selectedInstance.transform.position = Vector3.Lerp(
                 _selectedInstance.transform.position,
@@ -197,14 +235,12 @@ public class PlaceObject : MonoBehaviour
             return;
         }
 
-        // Scale
         if (!Mathf.Approximately(_pinchStartDist, 0f))
         {
             float newS = Mathf.Clamp(_pinchStartScale * (curDist / _pinchStartDist), minScale, maxScale);
             _selectedInstance.transform.localScale = Vector3.one * newS;
         }
 
-        // Rotate Y
         float delta = curAngle - _twistStartAngle;
         Vector3 e = _selectedInstance.transform.eulerAngles;
         e.y = _twistStartY - delta;
@@ -219,25 +255,66 @@ public class PlaceObject : MonoBehaviour
     {
         Quaternion rot = surfaceRot * Quaternion.Euler(rotationOffset);
         GameObject obj = Instantiate(_activePrefab, pos, rot);
+        float scale = GetScaleForActivePrefab();
 
-        // Force-reset local position (fixes off-pivot "invisible" spawns)
         obj.transform.localPosition = Vector3.zero;
         obj.transform.position = pos;
-        obj.transform.localScale = Vector3.one * spawnScale;
+        obj.transform.localScale = Vector3.one * scale;
         obj.name = _activePrefab.name;
 
-        // Store in the right slot
         if (_activePrefab == chairPrefab) _chairInstance = obj;
         else if (_activePrefab == sofaPrefab) _sofaInstance = obj;
         else if (_activePrefab == tablePrefab) _tableInstance = obj;
 
         _selectedInstance = obj;
-        Debug.Log($"[PlaceObject] ✓ Spawned '{obj.name}' at {pos} | scale={spawnScale}");
+        Debug.Log($"[PlaceObject] ✓ Spawned '{obj.name}' at {pos} | scale={scale}");
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  DELETE
+    // ═══════════════════════════════════════════════════════
+
+    private void DeleteCurrent()
+    {
+        GameObject toDelete = CurrentInstance();
+        if (toDelete == null) return;
+
+        string name = toDelete.name;
+
+        if (_activePrefab == chairPrefab) _chairInstance = null;
+        else if (_activePrefab == sofaPrefab) _sofaInstance = null;
+        else if (_activePrefab == tablePrefab) _tableInstance = null;
+
+        if (_selectedInstance == toDelete) _selectedInstance = null;
+
+        Destroy(toDelete);
+        Debug.Log($"[PlaceObject] 🗑️ Deleted '{name}'.");
     }
 
     // ═══════════════════════════════════════════════════════
     //  HELPERS
     // ═══════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Checks if a screen touch lands inside the OnGUI Remove button area
+    /// so it doesn't accidentally move the object when tapping Remove.
+    /// NOTE: OnGUI Y=0 is top; Input.touch Y=0 is bottom — flip Y here.
+    /// </summary>
+    private bool IsRemoveButtonArea(Vector2 touchPos)
+    {
+        if (_activePrefab == null || CurrentInstance() == null) return false;
+
+        float btnW = 260f;
+        float btnH = 80f;
+        float btnX = (Screen.width - btnW) / 2f;
+        float btnY = Screen.height - btnH - 40f; // OnGUI coords (Y from top)
+
+        // Convert touch Y (from bottom) to GUI Y (from top)
+        float guiY = Screen.height - touchPos.y;
+
+        Rect btnRect = new Rect(btnX, btnY, btnW, btnH);
+        return btnRect.Contains(new Vector2(touchPos.x, guiY));
+    }
 
     private GameObject CurrentInstance()
     {
@@ -245,6 +322,14 @@ public class PlaceObject : MonoBehaviour
         if (_activePrefab == sofaPrefab) return _sofaInstance;
         if (_activePrefab == tablePrefab) return _tableInstance;
         return null;
+    }
+
+    private float GetScaleForActivePrefab()
+    {
+        if (_activePrefab == chairPrefab) return chairScale;
+        if (_activePrefab == sofaPrefab) return sofaScale;
+        if (_activePrefab == tablePrefab) return tableScale;
+        return 1.0f;
     }
 
     private static bool IsTouchOnUI(Touch touch)
