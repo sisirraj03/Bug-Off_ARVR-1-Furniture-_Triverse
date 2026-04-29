@@ -2,15 +2,15 @@
 //  PlaceObject.cs  –  MASTER AR Furniture Placement Controller
 //  Unity AR Foundation + ARCore / ARKit
 //
-//  DELETE SYSTEM:
-//  - Select a furniture button (Chair/Sofa/Table)
-//  - If that object is already placed, a red "🗑 Remove" button
-//    appears at the bottom of the screen automatically
-//  - Tap "🗑 Remove" → object is instantly deleted
-//  - No Unity UI changes needed — button is drawn by OnGUI
+//  CAPTURE FIX:
+//  - Saves to persistent path first
+//  - Uses Android MediaStore to properly insert into Gallery
+//  - Toast confirms save
 // ============================================================
 
+using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using UnityEngine;
 using UnityEngine.XR.ARFoundation;
 using UnityEngine.XR.ARSubsystems;
@@ -40,6 +40,10 @@ public class PlaceObject : MonoBehaviour
     public float minScale = 0.05f;
     public float maxScale = 5.0f;
 
+    [Header("Capture")]
+    [Tooltip("Drag your Canvas GameObject here")]
+    public GameObject uiCanvas;
+
     // ═══════════════════════════════════════════════════════
     //  PRIVATE STATE
     // ═══════════════════════════════════════════════════════
@@ -53,16 +57,18 @@ public class PlaceObject : MonoBehaviour
     private GameObject _tableInstance;
     private GameObject _selectedInstance;
 
-    // Two-finger gesture state
     private float _pinchStartDist;
     private float _pinchStartScale;
     private float _twistStartAngle;
     private float _twistStartY;
     private bool _twoFingerActive;
 
-    // OnGUI style
     private GUIStyle _removeButtonStyle;
+    private GUIStyle _toastStyle;
     private bool _styleReady = false;
+    private bool _hideOnGUI = false;
+    private string _toastMsg = "";
+    private float _toastTimer = 0f;
 
     // ═══════════════════════════════════════════════════════
     //  UNITY LIFECYCLE
@@ -72,7 +78,7 @@ public class PlaceObject : MonoBehaviour
     {
         _arRaycast = GetComponent<ARRaycastManager>();
         if (_arRaycast == null)
-            Debug.LogError("[PlaceObject] ✖ ARRaycastManager missing on PlacementManager!");
+            Debug.LogError("[PlaceObject] ✖ ARRaycastManager missing!");
     }
 
     private void Start()
@@ -80,11 +86,14 @@ public class PlaceObject : MonoBehaviour
         if (chairPrefab == null) Debug.LogWarning("[PlaceObject] ✖ chairPrefab not assigned!");
         if (sofaPrefab == null) Debug.LogWarning("[PlaceObject] ✖ sofaPrefab not assigned!");
         if (tablePrefab == null) Debug.LogWarning("[PlaceObject] ✖ tablePrefab not assigned!");
-        Debug.Log("[PlaceObject] ✓ Ready — tap a button then tap the floor.");
+        if (uiCanvas == null) Debug.LogWarning("[PlaceObject] ✖ uiCanvas not assigned!");
+        Debug.Log("[PlaceObject] ✓ Ready.");
     }
 
     private void Update()
     {
+        if (_toastTimer > 0f) _toastTimer -= Time.deltaTime;
+
         if (Input.touchCount == 0) { _twoFingerActive = false; return; }
 
         if (Input.touchCount >= 2)
@@ -97,82 +106,162 @@ public class PlaceObject : MonoBehaviour
     }
 
     // ═══════════════════════════════════════════════════════
-    //  ON GUI — draws the Remove button when relevant
+    //  ON GUI
     // ═══════════════════════════════════════════════════════
 
     private void OnGUI()
     {
-        // Only show Remove button if the currently selected type is already placed
-        if (_activePrefab == null) return;
-        if (CurrentInstance() == null) return;
+        if (_hideOnGUI) return;
 
-        // Build style once
         if (!_styleReady)
         {
             _removeButtonStyle = new GUIStyle(GUI.skin.button)
             {
                 fontSize = 28,
                 fontStyle = FontStyle.Bold,
-                alignment = TextAnchor.MiddleCenter,
+                alignment = TextAnchor.MiddleCenter
             };
             _removeButtonStyle.normal.textColor = Color.white;
             _removeButtonStyle.hover.textColor = Color.white;
             _removeButtonStyle.active.textColor = Color.white;
+
+            _toastStyle = new GUIStyle(GUI.skin.box)
+            {
+                fontSize = 26,
+                fontStyle = FontStyle.Bold,
+                alignment = TextAnchor.MiddleCenter
+            };
+            _toastStyle.normal.textColor = Color.white;
             _styleReady = true;
         }
 
-        // Button size & position — bottom center of screen
-        float btnW = 260f;
-        float btnH = 80f;
-        float btnX = (Screen.width - btnW) / 2f;
-        float btnY = Screen.height - btnH - 40f;
-
-        Color prev = GUI.backgroundColor;
-        GUI.backgroundColor = new Color(0.85f, 0.1f, 0.1f, 1f); // red
-
-        if (GUI.Button(new Rect(btnX, btnY, btnW, btnH),
-                       "🗑  Remove " + _activePrefab.name, _removeButtonStyle))
+        // Remove button — bottom center
+        if (_activePrefab != null && CurrentInstance() != null)
         {
-            DeleteCurrent();
+            float btnW = 260f, btnH = 80f;
+            float btnX = (Screen.width - btnW) / 2f;
+            float btnY = Screen.height - btnH - 40f;
+
+            Color prev = GUI.backgroundColor;
+            GUI.backgroundColor = new Color(0.85f, 0.1f, 0.1f, 1f);
+            if (GUI.Button(new Rect(btnX, btnY, btnW, btnH),
+                           "🗑  Remove " + _activePrefab.name, _removeButtonStyle))
+                DeleteCurrent();
+            GUI.backgroundColor = prev;
         }
 
-        GUI.backgroundColor = prev;
+        // Toast — center screen
+        if (_toastTimer > 0f)
+        {
+            float tw = 380f, th = 70f;
+            float tx = (Screen.width - tw) / 2f;
+            float ty = (Screen.height - th) / 2f;
+
+            Color prev = GUI.backgroundColor;
+            GUI.backgroundColor = new Color(0.1f, 0.55f, 0.1f, 0.93f);
+            GUI.Box(new Rect(tx, ty, tw, th), _toastMsg, _toastStyle);
+            GUI.backgroundColor = prev;
+        }
     }
 
     // ═══════════════════════════════════════════════════════
-    //  PUBLIC SELECT BUTTONS (wire to ChairButton etc.)
+    //  PUBLIC SELECT BUTTONS
     // ═══════════════════════════════════════════════════════
 
-    public void SelectChair()
+    public void SelectChair() { _activePrefab = chairPrefab; _selectedInstance = _chairInstance; }
+    public void SelectSofa() { _activePrefab = sofaPrefab; _selectedInstance = _sofaInstance; }
+    public void SelectTable() { _activePrefab = tablePrefab; _selectedInstance = _tableInstance; }
+
+    // ═══════════════════════════════════════════════════════
+    //  CAPTURE — wire CaptureButton OnClick to this
+    // ═══════════════════════════════════════════════════════
+
+    public void CapturePhoto()
     {
-        _activePrefab = chairPrefab;
-        _selectedInstance = _chairInstance;
-        Debug.Log("[PlaceObject] Chair selected.");
+        StartCoroutine(TakeScreenshot());
     }
 
-    public void SelectSofa()
+    private IEnumerator TakeScreenshot()
     {
-        _activePrefab = sofaPrefab;
-        _selectedInstance = _sofaInstance;
-        Debug.Log("[PlaceObject] Sofa selected.");
-    }
+        // 1. Hide UI
+        _hideOnGUI = true;
+        if (uiCanvas != null) uiCanvas.SetActive(false);
 
-    public void SelectTable()
-    {
-        _activePrefab = tablePrefab;
-        _selectedInstance = _tableInstance;
-        Debug.Log("[PlaceObject] Table selected.");
+        // 2. Wait for UI to fully disappear
+        yield return new WaitForEndOfFrame();
+        yield return new WaitForEndOfFrame(); // two frames to be safe
+
+        // 3. Capture to texture
+        Texture2D screenTex = new Texture2D(Screen.width, Screen.height, TextureFormat.RGB24, false);
+        screenTex.ReadPixels(new Rect(0, 0, Screen.width, Screen.height), 0, 0);
+        screenTex.Apply();
+        byte[] imgBytes = screenTex.EncodeToJPG(95);
+        Destroy(screenTex);
+
+        // 4. Save to persistent path first (always works)
+        string fileName = "ARFurniture_" + System.DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".jpg";
+        string tempPath = Path.Combine(Application.persistentDataPath, fileName);
+        File.WriteAllBytes(tempPath, imgBytes);
+        Debug.Log($"[PlaceObject] Saved temp file: {tempPath}");
+
+        // 5. Restore UI immediately
+        if (uiCanvas != null) uiCanvas.SetActive(true);
+        _hideOnGUI = false;
+
+#if UNITY_ANDROID
+        // 6. Use Android MediaStore to insert properly into Gallery
+        yield return new WaitForSeconds(0.1f); // small delay for file flush
+
+        try
+        {
+            using (AndroidJavaClass mediaStoreImages = new AndroidJavaClass("android.provider.MediaStore$Images$Media"))
+            using (AndroidJavaClass unityPlayer = new AndroidJavaClass("com.unity3d.player.UnityPlayer"))
+            {
+                AndroidJavaObject activity = unityPlayer.GetStatic<AndroidJavaObject>("currentActivity");
+                AndroidJavaObject resolver = activity.Call<AndroidJavaObject>("getContentResolver");
+
+                // Insert image into MediaStore
+                string insertedPath = mediaStoreImages.CallStatic<string>(
+                    "insertImage",
+                    resolver,
+                    tempPath,
+                    fileName,
+                    "AR Furniture App Screenshot"
+                );
+
+                if (!string.IsNullOrEmpty(insertedPath))
+                {
+                    Debug.Log($"[PlaceObject] ✓ Inserted into Gallery: {insertedPath}");
+                    _toastMsg = "📷 Photo saved to Gallery!";
+                    _toastTimer = 2.5f;
+                }
+                else
+                {
+                    Debug.LogWarning("[PlaceObject] MediaStore insert returned null.");
+                    _toastMsg = "⚠️ Saved but check Files app";
+                    _toastTimer = 2.5f;
+                }
+            }
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogError($"[PlaceObject] Gallery insert failed: {ex.Message}");
+            _toastMsg = "⚠️ Saved to app folder";
+            _toastTimer = 2.5f;
+        }
+#else
+        _toastMsg   = "📷 Photo saved!";
+        _toastTimer = 2.5f;
+#endif
     }
 
     // ═══════════════════════════════════════════════════════
-    //  SINGLE TOUCH — tap to place, drag to move
+    //  SINGLE TOUCH
     // ═══════════════════════════════════════════════════════
 
     private void HandleSingleTouch(Touch touch)
     {
         if (IsTouchOnUI(touch)) return;
-
-        // Block touches in the OnGUI Remove button area
         if (IsRemoveButtonArea(touch.position)) return;
 
         if (_activePrefab == null)
@@ -186,7 +275,7 @@ public class PlaceObject : MonoBehaviour
         {
             if (!_arRaycast.Raycast(touch.position, Hits, TrackableType.PlaneWithinPolygon))
             {
-                Debug.Log("[PlaceObject] No plane hit — move phone slowly to scan floor.");
+                Debug.Log("[PlaceObject] No plane hit.");
                 return;
             }
 
@@ -194,14 +283,8 @@ public class PlaceObject : MonoBehaviour
             Quaternion hitRot = Hits[0].pose.rotation;
             GameObject existing = CurrentInstance();
 
-            if (existing == null)
-                SpawnFurniture(hitPos, hitRot);
-            else
-            {
-                existing.transform.position = hitPos;
-                _selectedInstance = existing;
-                Debug.Log($"[PlaceObject] Moved '{existing.name}'");
-            }
+            if (existing == null) SpawnFurniture(hitPos, hitRot);
+            else { existing.transform.position = hitPos; _selectedInstance = existing; }
         }
         else if (touch.phase == TouchPhase.Moved && _selectedInstance != null)
         {
@@ -214,7 +297,7 @@ public class PlaceObject : MonoBehaviour
     }
 
     // ═══════════════════════════════════════════════════════
-    //  TWO-FINGER — pinch = scale, twist = rotate Y
+    //  TWO-FINGER
     // ═══════════════════════════════════════════════════════
 
     private void HandlePinchTwist(Touch t0, Touch t1)
@@ -267,7 +350,7 @@ public class PlaceObject : MonoBehaviour
         else if (_activePrefab == tablePrefab) _tableInstance = obj;
 
         _selectedInstance = obj;
-        Debug.Log($"[PlaceObject] ✓ Spawned '{obj.name}' at {pos} | scale={scale}");
+        Debug.Log($"[PlaceObject] ✓ Spawned '{obj.name}' | scale={scale}");
     }
 
     // ═══════════════════════════════════════════════════════
@@ -279,41 +362,27 @@ public class PlaceObject : MonoBehaviour
         GameObject toDelete = CurrentInstance();
         if (toDelete == null) return;
 
-        string name = toDelete.name;
-
         if (_activePrefab == chairPrefab) _chairInstance = null;
         else if (_activePrefab == sofaPrefab) _sofaInstance = null;
         else if (_activePrefab == tablePrefab) _tableInstance = null;
 
         if (_selectedInstance == toDelete) _selectedInstance = null;
-
         Destroy(toDelete);
-        Debug.Log($"[PlaceObject] 🗑️ Deleted '{name}'.");
+        Debug.Log("[PlaceObject] 🗑️ Deleted.");
     }
 
     // ═══════════════════════════════════════════════════════
     //  HELPERS
     // ═══════════════════════════════════════════════════════
 
-    /// <summary>
-    /// Checks if a screen touch lands inside the OnGUI Remove button area
-    /// so it doesn't accidentally move the object when tapping Remove.
-    /// NOTE: OnGUI Y=0 is top; Input.touch Y=0 is bottom — flip Y here.
-    /// </summary>
     private bool IsRemoveButtonArea(Vector2 touchPos)
     {
         if (_activePrefab == null || CurrentInstance() == null) return false;
-
-        float btnW = 260f;
-        float btnH = 80f;
+        float btnW = 260f, btnH = 80f;
         float btnX = (Screen.width - btnW) / 2f;
-        float btnY = Screen.height - btnH - 40f; // OnGUI coords (Y from top)
-
-        // Convert touch Y (from bottom) to GUI Y (from top)
+        float btnY = Screen.height - btnH - 40f;
         float guiY = Screen.height - touchPos.y;
-
-        Rect btnRect = new Rect(btnX, btnY, btnW, btnH);
-        return btnRect.Contains(new Vector2(touchPos.x, guiY));
+        return new Rect(btnX, btnY, btnW, btnH).Contains(new Vector2(touchPos.x, guiY));
     }
 
     private GameObject CurrentInstance()
